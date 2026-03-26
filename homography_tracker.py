@@ -2,27 +2,12 @@
 homography_tracker.py
 ---------------------
 Cross-camera global ID assignment using foot-point projection,
-Euclidean distance matching, AND appearance ReID verification.
-
-WHY DISTANCE INSTEAD OF IoU:
-- IoU compares bounding box overlap in pixel space.
-- With oblique cameras, a person far away has their feet at the same
-  pixel height as the head of someone nearby → boxes overlap randomly.
-- Distance between projected FOOT POINTS on the ground plane is stable
-  regardless of perspective distortion.
-
-REID INTEGRATION:
-- After geometry matching, appearance similarity is used to confirm or
-  reject a proposed match between two cameras.
-- When a new global_id is created, the crop is registered in the ReID gallery.
-- At each frame, every active track's crop is registered to keep the gallery fresh.
+Euclidean distance matching, and optional appearance ReID verification.
 """
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-
-# ── Foot-point projection ──────────────────────────────────────────────────────
 
 def _project_point(x, y, H):
     p = (H @ np.array([x, y, 1], dtype=np.float64)).flatten()
@@ -62,8 +47,6 @@ def modify_bbox_source(bboxes, H):
     return np.asarray(result, dtype=np.float32)
 
 
-# ── Foot-point distance matching ───────────────────────────────────────────────
-
 def _get_foot(bbox):
     """Bottom-center of a box."""
     return ((bbox[0] + bbox[2]) / 2.0, bbox[3])
@@ -83,8 +66,8 @@ def foot_distance_match(proj_i, proj_j, dist_thresh):
     if len(proj_i) == 0 or len(proj_j) == 0:
         return [], list(range(len(proj_i))), list(range(len(proj_j)))
 
-    feet_i = np.array([_get_foot(b) for b in proj_i])  # (N, 2)
-    feet_j = np.array([_get_foot(b) for b in proj_j])  # (M, 2)
+    feet_i = np.array([_get_foot(b) for b in proj_i])
+    feet_j = np.array([_get_foot(b) for b in proj_j])
 
     cost = np.linalg.norm(feet_i[:, None] - feet_j[None, :], axis=2)
 
@@ -103,40 +86,35 @@ def foot_distance_match(proj_i, proj_j, dist_thresh):
     return matches, unmatched_i, unmatched_j
 
 
-# ── Multi-camera tracker ───────────────────────────────────────────────────────
-
 class MultiCameraTracker:
-
     def __init__(
         self,
         homographies: list,
         dist_thresh: float = 60,
         id_memory: int = 45,
-        reid=None,                    # ← NOUVEAU : instance de ReIDManager
-        reid_thresh: float = 0.40,    # ← NOUVEAU : seuil cosine pour valider un match
+        reid=None,
+        reid_thresh: float = 0.65,
     ):
         """
         Parameters
         ----------
-        homographies : list of 3×3 matrices (camera 0 = reference = identity).
+        homographies : list of 3x3 matrices (camera 0 = reference = identity).
         dist_thresh  : max foot-point distance (pixels) to match two tracks.
         id_memory    : frames to remember a lost ID before discarding it.
-        reid         : ReIDManager instance (optionnel — si None, désactivé).
-        reid_thresh  : cosine similarity minimum pour confirmer un match inter-cam.
+        reid         : optional ReIDManager instance.
+        reid_thresh  : cosine similarity minimum to confirm an inter-cam match.
         """
-        self.num_sources  = len(homographies)
+        self.num_sources = len(homographies)
         self.homographies = homographies
-        self.dist_thresh  = dist_thresh
-        self.id_memory    = id_memory
-        self.reid         = reid          # ← NOUVEAU
-        self.reid_thresh  = reid_thresh   # ← NOUVEAU
+        self.dist_thresh = dist_thresh
+        self.id_memory = id_memory
+        self.reid = reid
+        self.reid_thresh = reid_thresh
 
         self.next_id = 1
-        self.ids  = [{} for _ in range(self.num_sources)]   # local_id → global_id
-        self.age  = [{} for _ in range(self.num_sources)]   # local_id → frames seen
-        self.lost = {}  # (cam, local_id) → (global_id, last_bbox, ttl)
-
-    # ── Lost-buffer ────────────────────────────────────────────────────────────
+        self.ids = [{} for _ in range(self.num_sources)]
+        self.age = [{} for _ in range(self.num_sources)]
+        self.lost = {}
 
     def _recall_lost(self, cam, local_id, proj_bbox):
         fx, fy = _get_foot(proj_bbox)
@@ -161,15 +139,43 @@ class MultiCameraTracker:
                 to_del.append(key)
             else:
                 self.lost[key] = (gid, bbox, ttl - 1)
-        for k in to_del:
-            del self.lost[k]
+        for key in to_del:
+            del self.lost[key]
 
-    # ── ReID helpers ───────────────────────────────────────────────────────────
+    def _recoverable_reid_ids(self, active_ids) -> list[int]:
+        """
+        Only recover against IDs that are currently lost. Matching against the
+        full gallery can merge a brand-new person into an unrelated active ID.
+        """
+        return sorted({
+            gid
+            for gid, _, _ in self.lost.values()
+            if gid not in active_ids
+        })
+
+    def _recover_by_reid(self, frame, bbox, active_ids) -> int | None:
+        """
+        Recover a recently lost ID by appearance using the original image-space
+        bbox. Projected boxes are only valid for geometry matching.
+        """
+        if self.reid is None or frame is None:
+            return None
+
+        candidate_gids = self._recoverable_reid_ids(active_ids)
+        if not candidate_gids:
+            return None
+
+        emb = self.reid.extract_embedding(frame, bbox)
+        if emb is None:
+            return None
+
+        gid, _ = self.reid.find_best_match(emb, candidate_gids)
+        return gid
 
     def _reid_verify(self, gid_i: int, gid_j: int) -> bool:
         """
-        Retourne True si les deux global IDs ont une apparence compatible
-        (ou si le ReID est désactivé / pas encore de gallery).
+        Return True when the two global IDs have compatible appearance, or when
+        ReID is disabled / has no gallery entry yet.
         """
         if self.reid is None:
             return True
@@ -177,10 +183,7 @@ class MultiCameraTracker:
         return sim >= self.reid_thresh
 
     def _register_crops(self, tracks: list, frames: list) -> None:
-        """
-        Pour chaque track actif, enregistre le crop dans la gallery ReID
-        en utilisant l'ID global déjà assigné.
-        """
+        """Refresh the ReID gallery with crops from active tracks."""
         if self.reid is None or frames is None:
             return
 
@@ -193,18 +196,16 @@ class MultiCameraTracker:
                 if gid is not None:
                     self.reid.register(gid, frame, row[:4])
 
-    # ── Update ─────────────────────────────────────────────────────────────────
-
     def update(self, tracks: list, frames: list = None):
         """
         Parameters
         ----------
-        tracks : list of (N_i, 6) arrays per camera — [x1,y1,x2,y2, id, cls]
-        frames : list of raw BGR frames per camera (pour ReID). Optionnel.
+        tracks : list of (N_i, 6) arrays per camera [x1, y1, x2, y2, id, cls]
+        frames : list of raw BGR frames per camera. Optional.
 
         Returns
         -------
-        self.ids — list of dicts local_track_id → global_id
+        self.ids : list of dicts local_track_id -> global_id
         """
         proj_tracks = [
             modify_bbox_source(trks, self.homographies[i])
@@ -215,7 +216,6 @@ class MultiCameraTracker:
 
         for i in range(self.num_sources):
             for j in range(i + 1, self.num_sources):
-
                 if len(proj_tracks[i]) == 0 and len(proj_tracks[j]) == 0:
                     continue
 
@@ -225,37 +225,31 @@ class MultiCameraTracker:
                     proj_tracks[i], proj_tracks[j], self.dist_thresh
                 )
 
-                # ── Matched ────────────────────────────────────────────────
                 for idx_i, idx_j in matches:
                     id_i = int(proj_tracks[i][idx_i][4])
                     id_j = int(proj_tracks[j][idx_j][4])
 
-                    m_i   = self.ids[i].get(id_i)
-                    m_j   = self.ids[j].get(id_j)
+                    m_i = self.ids[i].get(id_i)
+                    m_j = self.ids[j].get(id_j)
                     age_i = self.age[i].get(id_i, 0)
                     age_j = self.age[j].get(id_j, 0)
 
                     if m_i is not None and age_i >= age_j and not matched_flags.get(m_i):
-                        # ── NOUVEAU : vérifier apparence avant d'accepter ──
-                        if m_j is not None and m_i != m_j:
-                            if not self._reid_verify(m_i, m_j):
-                                # apparences incompatibles → traiter comme non-matché
-                                unmatches_i.append(idx_i)
-                                unmatches_j.append(idx_j)
-                                continue
-                        # ─────────────────────────────────────────────────
+                        if m_j is not None and m_i != m_j and not self._reid_verify(m_i, m_j):
+                            unmatches_i.append(idx_i)
+                            unmatches_j.append(idx_j)
+                            continue
+
                         self.ids[j][id_j] = m_i
                         matched_flags[m_i] = True
                         active_global_ids.add(m_i)
 
                     elif m_j is not None and not matched_flags.get(m_j):
-                        # ── NOUVEAU : vérifier apparence ──────────────────
-                        if m_i is not None and m_i != m_j:
-                            if not self._reid_verify(m_i, m_j):
-                                unmatches_i.append(idx_i)
-                                unmatches_j.append(idx_j)
-                                continue
-                        # ─────────────────────────────────────────────────
+                        if m_i is not None and m_i != m_j and not self._reid_verify(m_i, m_j):
+                            unmatches_i.append(idx_i)
+                            unmatches_j.append(idx_j)
+                            continue
+
                         self.ids[i][id_i] = m_j
                         matched_flags[m_j] = True
                         active_global_ids.add(m_j)
@@ -277,20 +271,18 @@ class MultiCameraTracker:
                     self.age[i][id_i] = age_i + 1
                     self.age[j][id_j] = age_j + 1
 
-                # ── Unmatched i ────────────────────────────────────────────
                 for idx_i in unmatches_i:
                     id_i = int(proj_tracks[i][idx_i][4])
-                    m_i  = self.ids[i].get(id_i)
+                    m_i = self.ids[i].get(id_i)
 
                     if m_i is None:
                         rec = self._recall_lost(i, id_i, proj_tracks[i][idx_i])
-
-                        # ── NOUVEAU : ReID sur lost buffer ────────────────
-                        if rec is None and self.reid is not None and frames is not None and frames[i] is not None:
-                            emb = self.reid.extract_embedding(frames[i], proj_tracks[i][idx_i][:4])
-                            if emb is not None:
-                                rec, _ = self.reid.find_best_match(emb, self.reid.get_gallery_ids())
-                        # ─────────────────────────────────────────────────
+                        if rec is None and frames is not None:
+                            rec = self._recover_by_reid(
+                                frames[i],
+                                tracks[i][idx_i][:4],
+                                active_global_ids,
+                            )
 
                         gid = rec if rec is not None else self.next_id
                         if rec is None:
@@ -304,20 +296,18 @@ class MultiCameraTracker:
                     self.age[i][id_i] = self.age[i].get(id_i, 0) + 1
                     self.lost[(i, id_i)] = (gid, proj_tracks[i][idx_i], self.id_memory)
 
-                # ── Unmatched j ────────────────────────────────────────────
                 for idx_j in unmatches_j:
                     id_j = int(proj_tracks[j][idx_j][4])
-                    m_j  = self.ids[j].get(id_j)
+                    m_j = self.ids[j].get(id_j)
 
                     if m_j is None:
                         rec = self._recall_lost(j, id_j, proj_tracks[j][idx_j])
-
-                        # ── NOUVEAU : ReID sur lost buffer ────────────────
-                        if rec is None and self.reid is not None and frames is not None and frames[j] is not None:
-                            emb = self.reid.extract_embedding(frames[j], proj_tracks[j][idx_j][:4])
-                            if emb is not None:
-                                rec, _ = self.reid.find_best_match(emb, self.reid.get_gallery_ids())
-                        # ─────────────────────────────────────────────────
+                        if rec is None and frames is not None:
+                            rec = self._recover_by_reid(
+                                frames[j],
+                                tracks[j][idx_j][:4],
+                                active_global_ids,
+                            )
 
                         gid = rec if rec is not None else self.next_id
                         if rec is None:
@@ -332,9 +322,5 @@ class MultiCameraTracker:
                     self.lost[(j, id_j)] = (gid, proj_tracks[j][idx_j], self.id_memory)
 
         self._tick_lost(active_global_ids)
-
-        # ── NOUVEAU : mettre à jour la gallery ReID après chaque frame ────────
         self._register_crops(tracks, frames)
-        # ──────────────────────────────────────────────────────────────────────
-
         return self.ids

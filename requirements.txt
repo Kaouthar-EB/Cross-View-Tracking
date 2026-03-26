@@ -1,0 +1,20 @@
+# Core detection & deep learning (CPU-only — no CUDA required)
+torch
+torchvision
+ultralytics
+
+# Computer vision
+opencv-python
+opencv-contrib-python
+
+# Tracking & math
+numpy
+filterpy
+scipy
+
+# Utilities
+matplotlib
+tqdm
+
+pandas
+seaborn
